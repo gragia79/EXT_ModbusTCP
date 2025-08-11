@@ -1,0 +1,12 @@
+DubbleWord AT %MD0: DWORD; //comprende Word 0 e word 1
+Word2 AT %MW2: WORD; //Word 2 comprende Byte 4 e Byte 5
+Byte6 AT %MB6: BYTE; // Byte 6 e'la parte bassa di MW3
+Flag80 AT %MX8.0: BOOL; //il flag 8.0 e'il primo del MW4 MB8
+
+EmergenzaImpianto AT %IX0.0: BOOL; //Emergenza Impianto
+Flag_RitVcc AT %MX0.0: BOOL;
+Registro AT %MW100: WORD;
+Enable AT %MX1.0: BOOL;
+Preset AT %MW100: WORD := 100;
+FlagON AT %MX2.0: BOOL;
+TimCorrente AT %MW200: TIME;
