@@ -99,10 +99,20 @@ class TimerWrapper:
 # ---------------------------
 # Main Modbus wrapper class
 # ---------------------------
+
 class ModbusWrapper:
-    def __init__(self, ip, port=502, variable_file=None):
+    def __init__(self, ip, port=502, unit_id=0, variable_file=None):
         # ASSUMPTION: Use pyModbusTCP client; auto_open False (we manage open)
-        self.client = ModbusClient(host=ip, port=port, auto_open=False)
+        self.host = ip
+        self.port = port
+        self.unit_id = unit_id
+        self.client = ModbusClient(
+            host=self.host,
+            port=self.port,
+            unit_id=self.unit_id,
+            auto_open=False,
+            auto_close=False
+        )
         self.last_alive = None
         self._alive_state = False
         self._alive_lock = threading.Lock()
@@ -309,6 +319,16 @@ class ModbusWrapper:
             except Exception:
                 continue
 
+    def alive(self) -> bool:
+        with self._alive_lock:
+            try:
+                if self.client.is_open():
+                    self._alive_state = True
+                    self.last_alive = time.time()
+                    return True
+            except Exception:
+                pass
+
     # ---------------------------
     # Connection handling with retry (client answered Q6)
     # ---------------------------
@@ -321,7 +341,7 @@ class ModbusWrapper:
         with self._alive_lock:
             # quick return if already open
             try:
-                if self.client.is_open:
+                if self.client.is_open():
                     self._alive_state = True
                     self.last_alive = time.time()
                     return True
@@ -348,24 +368,107 @@ class ModbusWrapper:
                 pass
             self._alive_state = False
             return False
+        
+    def read_from_plc(self, base, num, bit=None):
+        """Read from PLC depending on base type (MW, MB, MX, MD)."""
+        if not self.alive():  # Ensure PLC connection is open
+            return None
+
+        try:
+            if base == "MW":  # Word (16-bit register)
+                regs = self.client.read_holding_registers(num, 1)  # Read one word
+                return regs[0] if regs else None  # Return value if read succeeded
+
+            elif base == "MB":  # Byte (half of a Word)
+                regs = self.client.read_holding_registers(num // 2, 1)  # Read parent word
+                if not regs:  # No data
+                    return None
+                word_val = regs[0]  # Extract word value
+                if num % 2 == 0:  # Even index → low byte
+                    return word_val & 0xFF
+                else:  # Odd index → high byte
+                    return (word_val >> 8) & 0xFF
+
+            elif base == "MX":  # Bit inside a byte
+                regs = self.client.read_holding_registers(num // 2, 1)  # Read parent word
+                if not regs:
+                    return None
+                word_val = regs[0]
+                byte_val = (word_val >> ((num % 2) * 8)) & 0xFF  # Select target byte
+                return bool((byte_val >> bit) & 1)  # Extract bit as boolean
+
+            elif base == "MD":  # Double word (32-bit)
+                regs = self.client.read_holding_registers(num, 2)  # Read two words
+                if regs and len(regs) == 2:
+                    return (regs[1] << 16) | regs[0]  # Combine into 32-bit value
+
+        except Exception as e:
+            logging.error(f"PLC read failed: {e}")  # Log read error
+            return None
+
+
+    def write_to_plc(self, base, num, value, bit=None):
+        """Write to PLC depending on base type."""
+        if not self.alive():  # Ensure PLC connection is open
+            return False
+
+        try:
+            if base == "MW":  # Write full 16-bit word
+                return self.client.write_single_register(num, int(value))
+
+            elif base == "MB":  # Write single byte (via read-modify-write of parent word)
+                parent = num // 2  # Parent MW index
+                regs = self.client.read_holding_registers(parent, 1)  # Read current word
+                word_val = regs[0] if regs else 0
+                if num % 2 == 0:  # Low byte
+                    word_val = (word_val & 0xFF00) | (int(value) & 0xFF)
+                else:  # High byte
+                    word_val = (word_val & 0x00FF) | ((int(value) & 0xFF) << 8)
+                return self.client.write_single_register(parent, word_val)
+
+            elif base == "MX":  # Write single bit
+                parent = num // 2  # Parent MW index
+                regs = self.client.read_holding_registers(parent, 1)  # Read current word
+                word_val = regs[0] if regs else 0
+                byte_val = (word_val >> ((num % 2) * 8)) & 0xFF  # Extract byte
+                if value:  # Set bit
+                    byte_val |= (1 << bit)
+                else:  # Clear bit
+                    byte_val &= ~(1 << bit)
+                if num % 2 == 0:  # Write back to low byte
+                    word_val = (word_val & 0xFF00) | byte_val
+                else:  # Write back to high byte
+                    word_val = (word_val & 0x00FF) | (byte_val << 8)
+                return self.client.write_single_register(parent, word_val)
+
+            elif base == "MD":  # Write double word (32-bit)
+                lo = value & 0xFFFF  # Lower 16 bits
+                hi = (value >> 16) & 0xFFFF  # Upper 16 bits
+                return self.client.write_multiple_registers(num, [lo, hi])
+
+        except Exception as e:
+            logging.error(f"PLC write failed: {e}")  # Log write error
+            return False
 
     # ---------------------------
     # Read / Write API (unified)
     # ---------------------------
     def read_var(self, name):
-        """Return the current value of a wrapper by name."""
-        obj = self.variables.get(name)
-        if obj is None:
+        obj = self.variables.get(name)                # Look up wrapper object by name
+        if obj is None:                                # If not defined, return None
             return None
-        # many wrapper classes have .value attr
-        return getattr(obj, "value", None)
-
+        base, num, bit = parse_address(obj.address)    # Break down %MW / %MB / %MX / %MD into parts
+        plc_val = self.read_from_plc(base, num, bit)   # Ask PLC for the live value
+        if plc_val is not None:                        # If PLC returned a value
+            obj.value = plc_val                        # Update wrapper with latest live value
+        return obj.value                               # Return the (now updated) value
+    
     def write_var(self, name, value, force: bool = False):
         """
-        Write to a variable and synchronize related addresses.
-        - If a variable is readonly, reject unless force==True.
-        - If the variable had an initial_value (:=) and preserve semantics desired,
-          we avoid overwriting unless force==True. (Client requested "learn once")
+        Write to a variable:
+        - Respect readonly and := initial value rules
+        - Write both locally (wrapper.value) and to the PLC
+        - Keep MW <-> MB <-> MX sync logic
         """
         obj = self.variables.get(name)
         if obj is None:
@@ -376,14 +479,24 @@ class ModbusWrapper:
             logging.warning(f"Write blocked: variable '{name}' is read-only")
             return False
 
-        # preserve initial defaults: if object has initial_value and not forced, do not overwrite
+        # preserve initial defaults unless force=True
         if getattr(obj, "initial_value", None) is not None and not force:
-            # client requested initial values be "read and learned once" - so demo won't overwrite them
             logging.info(f"Skipping write for '{name}' (initial value present). Use force=True to override.")
             return False
 
-        # perform the write via wrapper interface
-        # support .value property or .set() method
+        # get parsed address
+        try:
+            base, num, bit = parse_address(obj.address)
+        except Exception as e:
+            logging.error(f"Failed parsing address for {name}: {e}")
+            return False
+
+        # ---- 1. Try PLC write ----
+        plc_ok = self.write_to_plc(base, num, value, bit)
+        if not plc_ok:
+            logging.warning(f"PLC write failed for {name}, fallback to local only")
+
+        # ---- 2. Local update anyway (so simulation + aliases stay in sync) ----
         try:
             if hasattr(obj, "value"):
                 obj.value = value
@@ -392,28 +505,25 @@ class ModbusWrapper:
             else:
                 setattr(obj, "value", value)
         except Exception as e:
-            logging.error(f"Error writing {name}: {e}")
-            return False
+            logging.error(f"Error setting local value for {name}: {e}")
 
-        # after successful write, sync related addresses (MW<->MB<->MX)
+        # ---- 3. Sync related addresses ----
         with self._sync_lock:
             try:
-                base, num, bit = parse_address(obj.address)
-                # MW -> MB/MX
                 if base == "MW":
                     self._sync_mw_to_mb_mx(num)
                 elif base == "MB":
                     self._sync_mb_to_mw(num)
                 elif base == "MX":
-                    # MX key uses MB index and bit
                     self._sync_mx_to_mb_mw(num, bit)
                 elif base == "MD":
-                    # for now, MD (DWORD) -> treat as DWord; split into two Words? we leave basic
+                    # TODO: advanced DWORD sync if needed
                     pass
             except Exception as e:
                 logging.error(f"sync after write failed: {e}")
 
-        return True
+        return plc_ok
+    
 
     # ---------------------------
     # Synchronization helpers
