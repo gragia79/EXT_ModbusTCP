@@ -33,6 +33,7 @@ logging.basicConfig(level=logging.INFO)
 # ---------------------------
 # Helper: parse address
 # ---------------------------
+
 def parse_address(addr: str) -> Tuple[str, int, Optional[int]]:
     """
     Normalize addresses like:
@@ -40,24 +41,24 @@ def parse_address(addr: str) -> Tuple[str, int, Optional[int]]:
       %MB6    -> ('MB', 6, None)
       %MX8.0  -> ('MX', 8, 0)
       %MD0    -> ('MD', 0, None)
-      %IX0.0  -> ('IX', 0, 0)   (optional: treat as bit)
+      %IX0.0  -> ('IX', 0, 0)
+    Returns (base, num, bit) where bit may be None
     """
     s = addr.strip()
     if s.startswith("%"):
         s = s[1:]
-    # bit-address form: MX8.0 or IX0.0
-    if "." in s:
-        base = s[:2].upper()          # e.g. 'MX', 'IX'
+    s = s.upper()
+
+    if "." in s:  # bit-address form: MX8.0 or IX0.0
+        base = s[:2]            # first two letters = base
         left, bit_s = s.split(".", 1)
-        # Extract number after base letters
-        num = int(left[2:]) if left[2:].isdigit() else int(left[1:])
+        num = int(left[2:])     # digits after base up to the dot
         bit = int(bit_s)
         return base, num, bit
     else:
-        base = s[:2].upper()
+        base = s[:2]
         num = int(s[2:])
         return base, num, None
-
 
 def canonical_key(base: str, num: int, bit: Optional[int]) -> str:
     """Return canonical registry key."""
@@ -102,6 +103,7 @@ class TimerWrapper:
 
 class ModbusWrapper:
     def __init__(self, ip, port=502, unit_id=0, variable_file=None):
+    # def __init__(self, ip, port=1502, unit_id=1, variable_file=None):
         # ASSUMPTION: Use pyModbusTCP client; auto_open False (we manage open)
         self.host = ip
         self.port = port
@@ -113,6 +115,12 @@ class ModbusWrapper:
             auto_open=False,
             auto_close=False
         )
+        try:
+            self.client.debug = True
+        except Exception:
+            pass
+        self._last_plc_error = None
+
         self.last_alive = None
         self._alive_state = False
         self._alive_lock = threading.Lock()
@@ -120,6 +128,9 @@ class ModbusWrapper:
         self.registry = {}       # canonical address key -> wrapper object
         self.duplicates = {}     # canonical -> [names]
         self._sync_lock = threading.RLock()  # guard to avoid recursive sync
+        self.md_big_endian = False  # False = low word first (most Delta PLCs). 
+                            # Set True if the real PLC expects hi word first.
+
 
         # polling groups: name -> dict { thread, interval_ms, vars, stop_event }
         self.polling_groups = {}
@@ -139,7 +150,7 @@ class ModbusWrapper:
     def parse_variables_file(self, filepath: str):
         """
         Parse lines like:
-          Name AT %MW100: WORD := 100; // description (RO)
+        Name AT %MW100: WORD := 100; // description (RO)
         Detection:
         - initial_value parsed from ':= <num>'
         - readonly detected if 'RO' or 'read-only' present in comment (case-insensitive)
@@ -155,6 +166,7 @@ class ModbusWrapper:
                 line = raw.strip()
                 if not line or line.startswith("//"):
                     continue
+
                 description = ""
                 if "//" in line:
                     code_part, comment = line.split("//", 1)
@@ -166,17 +178,17 @@ class ModbusWrapper:
                 code_part = code_part.strip().rstrip(";").strip()
                 initial_value = None
                 readonly = False
+
                 # detect initial ':='
                 if ":=" in code_part:
                     before, after = code_part.split(":=", 1)
                     code_part = before.strip()
-                    # after may contain semicolon already removed
                     try:
                         initial_value = int(after.strip())
                     except Exception:
                         initial_value = after.strip()
 
-                # detect read-only markers in description (client said some are read-only)
+                # detect read-only markers in description
                 desc_lower = (description or "").lower()
                 if "ro" in desc_lower.split() or "read-only" in desc_lower or "readonly" in desc_lower:
                     readonly = True
@@ -191,6 +203,12 @@ class ModbusWrapper:
                     addr_part, dtype_part = rest.split(":", 1)
                     address = addr_part.strip()
                     dtype = dtype_part.strip().upper()
+
+                    # 🔹 Mark IX (discrete inputs) as read-only
+                    addr_clean = address.strip()
+                    if addr_clean.upper().startswith("%IX"):
+                        readonly = True
+
                     parsed.append({
                         "name": name,
                         "address": address,
@@ -370,7 +388,7 @@ class ModbusWrapper:
             return False
         
     def read_from_plc(self, base, num, bit=None):
-        """Read from PLC depending on base type (MW, MB, MX, MD)."""
+        """Read from PLC depending on base type (MW, MB, MX, MD, IX)."""
         if not self.alive():  # Ensure PLC connection is open
             return None
 
@@ -397,24 +415,35 @@ class ModbusWrapper:
                 byte_val = (word_val >> ((num % 2) * 8)) & 0xFF  # Select target byte
                 return bool((byte_val >> bit) & 1)  # Extract bit as boolean
 
-            elif base == "MD":  # Double word (32-bit)
-                regs = self.client.read_holding_registers(num, 2)  # Read two words
+            elif base == "MD":
+                regs = self.client.read_holding_registers(num, 2)
                 if regs and len(regs) == 2:
-                    return (regs[1] << 16) | regs[0]  # Combine into 32-bit value
+                    if getattr(self, "md_big_endian", False):
+                        return (regs[0] << 16) | regs[1]   # hi, lo
+                    else:
+                        return (regs[1] << 16) | regs[0]   # lo, hi (default)
+
+
+            elif base == "IX":  # Discrete input (read-only)
+                bits = self.client.read_discrete_inputs(num, 1)
+                if not bits:
+                    return None
+                return bool(bits[0])
 
         except Exception as e:
             logging.error(f"PLC read failed: {e}")  # Log read error
             return None
 
-
     def write_to_plc(self, base, num, value, bit=None):
-        """Write to PLC depending on base type."""
+        """Write to PLC depending on base type, with debug logging of results."""
         if not self.alive():  # Ensure PLC connection is open
             return False
 
         try:
             if base == "MW":  # Write full 16-bit word
-                return self.client.write_single_register(num, int(value))
+                res = self.client.write_single_register(num, int(value))
+                logging.debug(f"write_single_register({num}, {int(value)}) -> {res}")
+                return res
 
             elif base == "MB":  # Write single byte (via read-modify-write of parent word)
                 parent = num // 2  # Parent MW index
@@ -424,7 +453,9 @@ class ModbusWrapper:
                     word_val = (word_val & 0xFF00) | (int(value) & 0xFF)
                 else:  # High byte
                     word_val = (word_val & 0x00FF) | ((int(value) & 0xFF) << 8)
-                return self.client.write_single_register(parent, word_val)
+                res = self.client.write_single_register(parent, word_val)
+                logging.debug(f"write_single_register({parent}, {word_val}) [MB] -> {res}")
+                return res
 
             elif base == "MX":  # Write single bit
                 parent = num // 2  # Parent MW index
@@ -439,12 +470,17 @@ class ModbusWrapper:
                     word_val = (word_val & 0xFF00) | byte_val
                 else:  # Write back to high byte
                     word_val = (word_val & 0x00FF) | (byte_val << 8)
-                return self.client.write_single_register(parent, word_val)
+                res = self.client.write_single_register(parent, word_val)
+                logging.debug(f"write_single_register({parent}, {word_val}) [MX] -> {res}")
+                return res
 
-            elif base == "MD":  # Write double word (32-bit)
-                lo = value & 0xFFFF  # Lower 16 bits
-                hi = (value >> 16) & 0xFFFF  # Upper 16 bits
-                return self.client.write_multiple_registers(num, [lo, hi])
+            elif base == "MD":
+                lo = value & 0xFFFF
+                hi = (value >> 16) & 0xFFFF
+                regs = [hi, lo] if getattr(self, "md_big_endian", False) else [lo, hi]
+                res = self.client.write_multiple_registers(num, regs)
+                return res
+
 
         except Exception as e:
             logging.error(f"PLC write failed: {e}")  # Log write error
@@ -491,6 +527,11 @@ class ModbusWrapper:
             logging.error(f"Failed parsing address for {name}: {e}")
             return False
 
+        # 🚫 Early reject discrete inputs (IX) – read-only in Modbus
+        if base == "IX":
+            logging.warning(f"Write blocked: '{name}' is IX (discrete input) and read-only.")
+            return False
+
         # ---- 1. Try PLC write ----
         plc_ok = self.write_to_plc(base, num, value, bit)
         if not plc_ok:
@@ -522,8 +563,7 @@ class ModbusWrapper:
             except Exception as e:
                 logging.error(f"sync after write failed: {e}")
 
-        return plc_ok
-    
+        return plc_ok    
 
     # ---------------------------
     # Synchronization helpers

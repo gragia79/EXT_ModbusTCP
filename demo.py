@@ -1,80 +1,66 @@
-# demo.py
-from ext_modbus_blueprint import ModbusWrapper
+# demo.py / demo.py
 import time
 import logging
+from ext_modbus_blueprint import ModbusWrapper
 
 logging.basicConfig(level=logging.INFO)
 
-# --- LIVE PLC SETTINGS ---
-PLC_IP = "192.168.1.22"
-PLC_PORT = 502
-PLC_UNIT_ID = 0  # Graziano confirmed
+# --- LIVE PLC SETTINGS ---        # --- IMPOSTAZIONI PLC LIVE ---
+PLC_IP = "192.168.1.22"             # Indirizzo IP del PLC
+PLC_PORT = 502                      # Porta del PLC
+PLC_UNIT_ID = 0  # Graziano confirmed  # ID unità Modbus (confermato da Graziano)
 
-# Create wrapper with Graziano's PLC details + variables file
+# --- Create wrapper with variables.txt ---     # --- Crea wrapper con variables.txt ---
 mw = ModbusWrapper(ip=PLC_IP, port=PLC_PORT, variable_file="variables.txt")
-mw.client.unit_id = PLC_UNIT_ID  # pyModbusTCP requires explicit unit_id
+mw.client.unit_id = PLC_UNIT_ID
 
-print("=== Loaded Variables from variables.txt ===")
+print("=== STEP 1: Connect ===")     # === PASSO 1: Connessione ===
+if not mw.alive():
+    print(f"Could not connect to PLC {PLC_IP}:{PLC_PORT}")  # ⚠️ Impossibile connettersi al PLC ...
+    exit(1)
+print(f"Connected to {PLC_IP}:{PLC_PORT}, unit={PLC_UNIT_ID}\n")  # Connesso a ...
+
+print("=== STEP 2: Loaded variables ===")     # === PASSO 2: Variabili caricate ===
 for name, obj in mw.variables.items():
     t = obj.__class__.__name__
-    init = getattr(obj, "initial_value", None)
     ro = getattr(obj, "readonly", False)
-    print(f"{name} ({t}) @ {obj.address} -> init={init} readonly={ro} desc='{getattr(obj,'description', '')}'")
-
-print("\n=== LIVE TEST MODE ===")
-
-# --- STEP 1: Check connection ---
-alive = mw.alive()
-print(f"[alive()] Connection status: {alive}\n")
-if not alive:
-    print("⚠️ Could not connect to PLC. Check VPN / IP / port 502.")
-    exit(1)
-
-# --- STEP 2: Read initial values ---
-print("Initial values (read from PLC):")
-for name in mw.variables:
-    val = mw.read_var(name)
-    print(f" • {name} = {val}")
+    init = getattr(obj, "initial_value", None)
+    print(f"{name} ({t}) @ {obj.address} readonly={ro} init={init}")
+    # Stampa nome, tipo, indirizzo, se è sola lettura, e valore iniziale
 print()
 
-# --- STEP 3: Try writing safe test values ---
-print("Writing test values (skipping := defaults unless force=True):")
+print("=== STEP 3: Read initial values ===")     # === PASSO 3: Leggi valori iniziali ===
+for name in mw.variables:
+    val = mw.read_var(name)
+    if val is None:
+        print(f" • {name} -> None (not readable via Modbus)")   # Non leggibile via Modbus
+    else:
+        print(f" • {name} = {val}")    # Mostra valore letto
+time.sleep(0.2)
+print()
+
+print("=== STEP 4: Write test values ===")     # === PASSO 4: Scrittura valori di test ===
 for i, name in enumerate(mw.variables):
     obj = mw.variables[name]
 
-    # Skip read-only or := values unless forced
-    if getattr(obj, "readonly", False):
-        print(f" - skipping {name} (read-only)")
-        continue
-    if getattr(obj, "initial_value", None) is not None:
-        print(f" - skipping {name} (initial := present)")
+    # Skip read-only (%IX) and constants (:=)
+    # Salta variabili di sola lettura (%IX) e con valore costante (:=)
+    if getattr(obj, "readonly", False) or getattr(obj, "initial_value", None) is not None:
+        print(f" - skipping {name} (read-only or := default)")  # Salto...
         continue
 
-    # Write test values (Flags → alternating True/False, others → 10, 20, 30…)
-    if obj.__class__.__name__ == "Flag":
-        mw.write_var(name, bool(i % 2))
-    else:
-        mw.write_var(name, (i + 1) * 10)
+    # Example write: Flags alternate True/False, Words get 100+i*10
+    # Esempio di scrittura: Flag alterna True/False, Word = 100+i*10
+    test_value = bool(i % 2) if obj.__class__.__name__ == "Flag" else (100 + i * 10)
 
-# --- STEP 4: Read back after writes ---
-print("Values after write (read back from PLC):")
+    ok = mw.write_var(name, test_value)
+    print(f" -> write {name} = {test_value} success={ok}")  # Scrive e mostra se ha avuto successo
+    time.sleep(0.1)  # breathing space / pausa breve
+
+print("\n=== STEP 5: Read back after writes ===")    # === PASSO 5: Leggi dopo scrittura ===
 for name in mw.variables:
-    print(f" • {name} = {mw.read_var(name)}")
+    val = mw.read_var(name)
+    print(f" • {name} = {val}")   # Mostra nuovo valore letto
 print()
 
-# --- STEP 5: Demonstrate isChanged() ---
-print("Checking isChanged() behaviour (first call True if changed, second False):")
-for name, obj in mw.variables.items():
-    if hasattr(obj, "isChanged"):
-        print(f" {name} changed? {obj.isChanged()}")
-        print(f" {name} changed now? {obj.isChanged()}")
-print()
-
-# --- STEP 6: Polling demo (first 2 variables) ---
-poll_vars = list(mw.variables.keys())[:2]
-print(f"Starting polling group for {poll_vars} (500 ms) — running 3 cycles...")
-mw.add_polling_group("demo_group", poll_vars, interval_ms=500)
-time.sleep(1.6)  # let it run ~3 cycles
-mw.stop_polling_group("demo_group")
-
-print("\n=== END OF LIVE DEMO ===")
+print("=== END OF DEMO ===")      # === FINE DEMO ===
