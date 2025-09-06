@@ -1,66 +1,110 @@
-# demo.py / demo.py
+# demo.py Main Demo.py 
 import time
 import logging
+from threading import Thread
 from ext_modbus_blueprint import ModbusWrapper
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-# --- LIVE PLC SETTINGS ---        # --- IMPOSTAZIONI PLC LIVE ---
-PLC_IP = "192.168.1.22"             # Indirizzo IP del PLC
-PLC_PORT = 502                      # Porta del PLC
-PLC_UNIT_ID = 0  # Graziano confirmed  # ID unità Modbus (confermato da Graziano)
+# --- PLC SETTINGS ---   
+# PLC_IP = "192.168.1.22"
+# PLC_PORT = 502
+# PLC_UNIT_ID = 0  # Graziano confirmed
 
-# --- Create wrapper with variables.txt ---     # --- Crea wrapper con variables.txt ---
-mw = ModbusWrapper(ip=PLC_IP, port=PLC_PORT, variable_file="variables.txt")
-mw.client.unit_id = PLC_UNIT_ID
 
-print("=== STEP 1: Connect ===")     # === PASSO 1: Connessione ===
-if not mw.alive():
-    print(f"Could not connect to PLC {PLC_IP}:{PLC_PORT}")  # ⚠️ Impossibile connettersi al PLC ...
-    exit(1)
-print(f"Connected to {PLC_IP}:{PLC_PORT}, unit={PLC_UNIT_ID}\n")  # Connesso a ...
+# --- PLC SETTINGS (simulation or real) ---
+PLC_IP = "127.0.0.1"    # or "192.168.1.22" for Graziano’s real PLC
+PLC_PORT = 1502         # 502 for real PLC
+PLC_UNIT_ID = 1         # 0 for real PLC
 
-print("=== STEP 2: Loaded variables ===")     # === PASSO 2: Variabili caricate ===
-for name, obj in mw.variables.items():
-    t = obj.__class__.__name__
-    ro = getattr(obj, "readonly", False)
-    init = getattr(obj, "initial_value", None)
-    print(f"{name} ({t}) @ {obj.address} readonly={ro} init={init}")
-    # Stampa nome, tipo, indirizzo, se è sola lettura, e valore iniziale
-print()
+mw = ModbusWrapper(ip=PLC_IP, port=PLC_PORT, unit_id=PLC_UNIT_ID, variable_file="variables.txt")
+# STEP 1: Auto-polling group
+print("=== STEP 1: Auto-polling group ===")
+mw.add_polling_group("main", ["Word2", "Flag_RitVcc"], interval_ms=1000, max_cycles=0)
 
-print("=== STEP 3: Read initial values ===")     # === PASSO 3: Leggi valori iniziali ===
-for name in mw.variables:
-    val = mw.read_var(name)
-    if val is None:
-        print(f" • {name} -> None (not readable via Modbus)")   # Non leggibile via Modbus
+# STEP 2: Finite polling group (manual start)
+print("=== STEP 2: Finite polling group (must be started manually) ===")
+pg = mw.add_polling_group("page", ["Enable", "Preset"], interval_ms=500, max_cycles=5)
+
+
+def main():
+
+
+    print("=== STEP 0: Try to connect ===")
+    if not mw.connect(retries=3, retry_delay=1.0):
+        print("Initial connect failed, continuing offline mode...")
     else:
-        print(f" • {name} = {val}")    # Mostra valore letto
-time.sleep(0.2)
-print()
+        print("Connected successfully.")
+   
+    # STEP 2b: Show auto-expanded aliases
+    print("=== STEP 2b: Auto-expansion check for Word2 ===")
+    aliases = [name for name in mw.variables.keys() if name.startswith("Word2")]
+    for alias in sorted(aliases):
+        wrapper = mw.variables[alias]
+        print(f"Alias: {alias:12s} → {wrapper.address} ({wrapper.__class__.__name__})")
+        print( mw.read_var(alias))
+    
+    # STEP 3: Manual read
+    print("=== STEP 3: Manual read test ===")
+    try:
+        print("Reading Word2 manually:", mw.read_var("Word2"))
+    except Exception as e:
+        print("Manual read failed:", e)
 
-print("=== STEP 4: Write test values ===")     # === PASSO 4: Scrittura valori di test ===
-for i, name in enumerate(mw.variables):
-    obj = mw.variables[name]
+    # STEP 4: Manual write
+    print("=== STEP 4: Manual write test ===")
+    try:
+        mw.write_var("Preset", 42, force=True)
+        print("Preset written = 42")
+    except Exception as e:
+        print("Manual write failed:", e)
 
-    # Skip read-only (%IX) and constants (:=)
-    # Salta variabili di sola lettura (%IX) e con valore costante (:=)
-    if getattr(obj, "readonly", False) or getattr(obj, "initial_value", None) is not None:
-        print(f" - skipping {name} (read-only or := default)")  # Salto...
-        continue
+    # STEP 5: Start finite polling group
+    print("=== STEP 5: Start finite polling group ===")
+    pg.start()
 
-    # Example write: Flags alternate True/False, Words get 100+i*10
-    # Esempio di scrittura: Flag alterna True/False, Word = 100+i*10
-    test_value = bool(i % 2) if obj.__class__.__name__ == "Flag" else (100 + i * 10)
+    # STEP 6: Byte/Word sync test
+    print("=== STEP 6: Byte/Word sync test ===")
+    try:
+        print("Writing Word2 = 0x1234 ...")
+        mw.write_var("Word2", 0x1234, force=True)
 
-    ok = mw.write_var(name, test_value)
-    print(f" -> write {name} = {test_value} success={ok}")  # Scrive e mostra se ha avuto successo
-    time.sleep(0.1)  # breathing space / pausa breve
+        print("Byte6 (low byte of Word2) =", mw.read_var("Byte6"))
+        print("Word2 =", hex(mw.read_var("Word2")))
 
-print("\n=== STEP 5: Read back after writes ===")    # === PASSO 5: Leggi dopo scrittura ===
-for name in mw.variables:
-    val = mw.read_var(name)
-    print(f" • {name} = {val}")   # Mostra nuovo valore letto
-print()
+        print("Now writing Byte6 = 0xAB ...")
+        mw.write_var("Byte6", 0xAB, force=True)
 
-print("=== END OF DEMO ===")      # === FINE DEMO ===
+        print("Word2 =", hex(mw.read_var("Word2")))
+        print("Byte6 =", hex(mw.read_var("Byte6")))
+
+        print("Now toggling Flag80 ...")
+        mw.write_var("Flag80", True, force=True)
+
+        print("Flag80 =", mw.read_var("Flag80"))
+        print("Byte6 =", bin(mw.read_var("Byte6")))
+        print("Word2 =", hex(mw.read_var("Word2")))
+    except Exception as e:
+        print("Byte/Word sync test failed:", e)
+
+    # STEP 7: Integration idle loop (non-blocking)
+    print("=== STEP 7: Integration-ready idle loop ===")
+    print("Now the script keeps running (does NOT exit).")
+    print("Press CTRL+C to quit manually.")
+
+
+if __name__ == "__main__":
+
+
+    try:
+        while True:
+            if not mw.alive():
+                logging.debug("Main loop: PLC not connected, waiting...")
+                # Optional: try reconnect automatically
+                mw.connect(retries=1, retry_delay=2.0)
+            else:
+                main()
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("Exiting demo...")
+
