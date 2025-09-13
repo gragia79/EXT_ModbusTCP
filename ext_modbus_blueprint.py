@@ -104,61 +104,64 @@ class TimerWrapper:
 # ---------------------------
 
 class ModbusWrapper:
-    def __init__(self, ip, port=502, unit_id=0, variable_file="variables.txt"):
-        # ASSUMPTION: Use pyModbusTCP client; auto_open False (we manage open)
-        self.host = ip
-        self.port = port
-        self.unit_id = unit_id
-        self.client = ModbusClient(
-            host=self.host,
-            port=self.port,
-            unit_id=self.unit_id,
-            auto_open=False,
-            auto_close=False
-        )
-        try:
-            self.client.debug = True
-        except Exception:
-            pass
-        self._last_plc_error = None
-        
-        self._client_lock = threading.RLock()  # Guards all socket I/O so it’s thread‑safe
-        self._vars_lock = threading.RLock()   # protects variables/registry/duplicates modifications
+    class ModbusWrapper:
+        def __init__(self, ip, port=502, unit_id=0, variable_file="variables.txt", auto_expand_words: bool = False):
 
-        self.last_alive = None
-        self._alive_state = False
-        self._alive_lock = threading.Lock()
-        self.variables = {}      # name -> wrapper object (Flag/Word/Byte/DWord/TimerWrapper)
-        self.registry = {}       # canonical address key -> wrapper object
-        self.duplicates = {}     # canonical -> [names]
-        self._sync_lock = threading.RLock()  # guard to avoid recursive sync
-        self.md_big_endian = False  # False = low word first (most Delta PLCs).
-                                    # Set True if the real PLC expects hi word first.
+            # ASSUMPTION: Use pyModbusTCP client; auto_open False (we manage open)
+            self.host = ip
+            self.port = port
+            self.unit_id = unit_id
+            self.client = ModbusClient(
+                host=self.host,
+                port=self.port,
+                unit_id=self.unit_id,
+                auto_open=False,
+                auto_close=False
+            )
+            try:
+                self.client.debug = True
+            except Exception:
+                pass
+            self._last_plc_error = None
+            self.auto_expand_words = bool(auto_expand_words)
+            
+            self._client_lock = threading.RLock()  # Guards all socket I/O so it’s thread‑safe
+            self._vars_lock = threading.RLock()   # protects variables/registry/duplicates modifications
 
-        # timing / breathing space for PLC after writes (seconds)
-        self.write_delay = 0.1   # legacy field (still supported)
-        self.read_delay = 0.1    # delay after reads if needed
+            self.last_alive = None
+            self._alive_state = False
+            self._alive_lock = threading.Lock()
+            self.variables = {}      # name -> wrapper object (Flag/Word/Byte/DWord/TimerWrapper)
+            self.registry = {}       # canonical address key -> wrapper object
+            self.duplicates = {}     # canonical -> [names]
+            self._sync_lock = threading.RLock()  # guard to avoid recursive sync
+            self.md_big_endian = False  # False = low word first (most Delta PLCs).
+                                        # Set True if the real PLC expects hi word first.
 
-        # how long to wait after a successful write before next access (milliseconds)
-        self.write_settle_ms = 80  # Graziano wants waits inside the function
+            # timing / breathing space for PLC after writes (seconds)
+            self.write_delay = 0.1   # legacy field (still supported)
+            self.read_delay = 0.1    # delay after reads if needed
+
+            # how long to wait after a successful write before next access (milliseconds)
+            self.write_settle_ms = 80  # Graziano wants waits inside the function
 
 
-        # polling groups: name -> dict { thread, interval_ms, vars, stop_event }
-        self.polling_groups = {}
+            # polling groups: name -> dict { thread, interval_ms, vars, stop_event }
+            self.polling_groups = {}
 
 
-        # allow relative defaults for the variables file
-        if variable_file and not os.path.isabs(variable_file):
-            variable_file = os.path.join(os.getcwd(), variable_file)
+            # allow relative defaults for the variables file
+            if variable_file and not os.path.isabs(variable_file):
+                variable_file = os.path.join(os.getcwd(), variable_file)
 
-        if variable_file:
-            parsed = self.parse_variables_file(variable_file)
-            self.instantiate_wrappers(parsed)
-            # build registry from instantiated wrappers
-            self.build_address_registry()
-            # log duplicates (aliases)
-            for k, names in self.duplicates.items():
-                logging.warning(f"Alias detected: address {k} used by names {names}")
+            if variable_file:
+                parsed = self.parse_variables_file(variable_file)
+                self.instantiate_wrappers(parsed)
+                # build registry from instantiated wrappers
+                self.build_address_registry()
+                # log duplicates (aliases)
+                for k, names in self.duplicates.items():
+                    logging.warning(f"Alias detected: address {k} used by names {names}")
 
     # ---------------------------
     # Parser (handles := defaults and readonly marker in comment)
@@ -471,16 +474,23 @@ class ModbusWrapper:
                 self.registry[key] = obj
                 self.duplicates.setdefault(key, [name])
 
+
                 # -----------------------------------------------------
-                # 🔹 Auto-expansion logic (Word → Byte → Bit)
+                # 🔹 Auto-expansion logic (Word -> Byte -> Bit) - gated
                 # -----------------------------------------------------
-                if not auto_generated:
+                # Expand only if explicitly requested (via v["expand"] == True)
+                # OR if wrapper was created with global auto_expand_words True.
+                should_expand = self.auto_expand_words or v.get("expand", False)
+
+                if should_expand and not auto_generated:
                     if dtype == "WORD":
+                        # compute MB indices
                         low_byte = num * 2
                         high_byte = num * 2 + 1
+
                         aliases = [
                             {
-                                "name": f"{name}_LOW",
+                                "name": f"{name}_LowByte",
                                 "address": f"%MB{low_byte}",
                                 "dtype": "BYTE",
                                 "description": f"Auto low byte of {name}",
@@ -489,7 +499,7 @@ class ModbusWrapper:
                                 "auto_generated": True,
                             },
                             {
-                                "name": f"{name}_HIGH",
+                                "name": f"{name}_HighByte",
                                 "address": f"%MB{high_byte}",
                                 "dtype": "BYTE",
                                 "description": f"Auto high byte of {name}",
@@ -498,15 +508,38 @@ class ModbusWrapper:
                                 "auto_generated": True,
                             },
                         ]
+                        # bit aliases
+                        for b in range(8):
+                            aliases.append({
+                                "name": f"{name}_LowBit{b}",
+                                "address": f"%MX{low_byte}.{b}",
+                                "dtype": "BOOL",
+                                "description": f"Auto low bit {b} of {name}",
+                                "initial_value": None,
+                                "readonly": readonly,
+                                "auto_generated": True,
+                            })
+                            aliases.append({
+                                "name": f"{name}_HighBit{b}",
+                                "address": f"%MX{high_byte}.{b}",
+                                "dtype": "BOOL",
+                                "description": f"Auto high bit {b} of {name}",
+                                "initial_value": None,
+                                "readonly": readonly,
+                                "auto_generated": True,
+                            })
+
                         logging.info(f"Auto-expanded {name} (%MW{num}) → %MB{low_byte}, %MB{high_byte}")
+                        # instantiate aliases without replacing registry
                         self.instantiate_wrappers(aliases, replace=False)
 
                     elif dtype == "BYTE":
+                        # If a BYTE is explicitly created with expand=True, create its bits.
                         bit_base = num
                         aliases = []
                         for b in range(8):
                             aliases.append({
-                                "name": f"{name}_BIT{b}",
+                                "name": f"{name}_Bit{b}",
                                 "address": f"%MX{bit_base}.{b}",
                                 "dtype": "BOOL",
                                 "description": f"Auto bit {b} of {name}",
@@ -516,6 +549,7 @@ class ModbusWrapper:
                             })
                         logging.info(f"Auto-expanded {name} (%MB{num}) → %MX{num}.0–%MX{num}.7")
                         self.instantiate_wrappers(aliases, replace=False)
+
 
                 # -----------------------------------------------------
                 # 🔹 Sync new expansions to parent (optional but cleaner)
@@ -527,176 +561,101 @@ class ModbusWrapper:
                         logging.debug(f"Initial sync failed for MW{num}: {e}")
 
 
-    # def instantiate_wrappers(self, parsed_vars, replace: bool = True):
-    #     """
-    #     Create wrapper objects. If two names map to same canonical address,
-    #     they will point to the same wrapper instance (aliasing).
 
-    #     If replace=True the function will reset self.variables/self.registry (used at startup).
-    #     If replace=False it will add to the existing registry (used for on-the-fly variables).
-    #     """
-    #     with self._vars_lock:
-    #         if replace:
-    #             self.variables = {}
-    #             self.registry = {}
-    #             self.duplicates = {}
+    # ---------------------------
+    # Expanding the word2 into low bits and bytes, 
+    # this process was defualt but we dont need it always and it was taking up too much memory, 
+    # so we will only trigger it when we need it
+    # ---------------------------
 
-    #         for v in parsed_vars:
-    #             name = v["name"]
-    #             address = v["address"]
-    #             dtype = v["dtype"]
-    #             desc = v["description"]
-    #             init = v["initial_value"]
-    #             readonly = v["readonly"]
+    def expansion(self, *var_names):
+        """
+        Explicitly create Byte/Bit aliases for the given Word variable NAMES.
+        Usage: mw.expansion("Word2", "Word200")
+        Returns list of created alias names.
+        """
+        parsed_aliases = []
+        created = []
 
-    #             base, num, bit = parse_address(address)
-    #             key = canonical_key(base, num, bit)
+        for vn in var_names:
+            with self._vars_lock:
+                obj = self.variables.get(vn)
+            if not obj:
+                logging.warning(f"expansion(): variable '{vn}' not found, skipping")
+                continue
 
-    #             # If an object already exists for this address, use it (alias)
-    #             existing = self.registry.get(key)
+            try:
+                base, num, bit = parse_address(obj.address)
+            except Exception as e:
+                logging.warning(f"expansion(): cannot parse address for {vn}: {e}")
+                continue
 
-    #             if existing:
-    #                 # alias: reuse existing object, add name mapping
-    #                 self.variables[name] = existing
-    #                 self.duplicates.setdefault(key, [])
-    #                 if name not in self.duplicates[key]:
-    #                     self.duplicates[key].append(name)
+            if base != "MW":
+                logging.warning(f"expansion(): variable '{vn}' is not a Word (base={base}), skipping")
+                continue
 
-    #                 # If alias has an initial value and main object has no value yet
-    #                 if init is not None:
-    #                     if getattr(existing, "initial_value", None) is None:
-    #                         existing.initial_value = init
-    #                     if getattr(existing, "value", None) is None:
-    #                         try:
-    #                             existing.value = int(init)
-    #                         except Exception:
-    #                             existing.value = init
-    #                 continue
+            low_b = num * 2
+            high_b = low_b + 1
 
-    #             # create appropriate wrapper
-    #             if dtype in ("BOOL", "BIT"):
-    #                 obj = Flag(name, address, desc)
-    #             elif dtype == "BYTE":
-    #                 obj = Byte(name, address, desc)
-    #             elif dtype == "DWORD":
-    #                 obj = DWord(name, address, desc)
-    #             elif dtype == "TIME":
-    #                 obj = TimerWrapper(name, address, desc)  
-                    
-                    
-    #             # with initial sync 
-    #             elif dtype == "WORD":
-    #                 obj = Word(name, address, desc)
+            # Byte aliases
+            parsed_aliases.append({
+                "name": f"{vn}_LowByte",
+                "address": f"%MB{low_b}",
+                "dtype": "BYTE",
+                "description": f"Auto-alias low byte from {vn}",
+                "initial_value": None,
+                "readonly": False,
+                "auto_generated": True,
+            })
+            parsed_aliases.append({
+                "name": f"{vn}_HighByte",
+                "address": f"%MB{high_b}",
+                "dtype": "BYTE",
+                "description": f"Auto-alias high byte from {vn}",
+                "initial_value": None,
+                "readonly": False,
+                "auto_generated": True,
+            })
 
-    #                 # metadata
-    #                 obj.initial_value = init
-    #                 obj.readonly = readonly
+            # Bit aliases for each byte
+            for b in range(8):
+                parsed_aliases.append({
+                    "name": f"{vn}_LowBit{b}",
+                    "address": f"%MX{low_b}.{b}",
+                    "dtype": "BOOL",
+                    "description": f"Auto-alias low bit {b} from {vn}",
+                    "initial_value": None,
+                    "readonly": False,
+                    "auto_generated": True,
+                })
+                parsed_aliases.append({
+                    "name": f"{vn}_HighBit{b}",
+                    "address": f"%MX{high_b}.{b}",
+                    "dtype": "BOOL",
+                    "description": f"Auto-alias high bit {b} from {vn}",
+                    "initial_value": None,
+                    "readonly": False,
+                    "auto_generated": True,
+                })
 
-    #                 # apply initial value if present
-    #                 if init is not None:
-    #                     try:
-    #                         obj.value = int(init)
-    #                     except Exception:
-    #                         obj.value = init
+        if not parsed_aliases:
+            logging.info("expansion(): no aliases generated")
+            return []
 
-    #                 # store object in both variables and registry
-    #                 self.variables[name] = obj
-    #                 self.registry[key] = obj
-    #                 self.duplicates.setdefault(key, [name])
+        with self._vars_lock:
+            self.instantiate_wrappers(parsed_aliases, replace=False)
+            self.build_address_registry()
+            for a in parsed_aliases:
+                created.append(a["name"])
 
-    #                 # 🔹 Auto-expand Word into Byte + Bit aliases
-    #                 try:
-    #                     base, num, bit = parse_address(address)
-    #                     if base == "MW":
-    #                         low_b = num * 2
-    #                         high_b = low_b + 1
+        logging.info(f"expansion(): created aliases for {', '.join(var_names)}")
+        return created
 
-    #                         aliases = [
-    #                             (f"{name}_LowByte", f"%MB{low_b}", "BYTE"),
-    #                             (f"{name}_HighByte", f"%MB{high_b}", "BYTE"),
-    #                         ]
-    #                         for b in range(8):
-    #                             aliases.append((f"{name}_LowBit{b}", f"%MX{low_b}.{b}", "BOOL"))
-    #                             aliases.append((f"{name}_HighBit{b}", f"%MX{high_b}.{b}", "BOOL"))
+    # alias() is a friendly synonym for expansion()
+    def alias(self, *var_names):
+        return self.expansion(*var_names)
 
-    #                         for alias_name, alias_addr, alias_dtype in aliases:
-    #                             parsed_alias = {
-    #                                 "name": alias_name,
-    #                                 "address": alias_addr,
-    #                                 "dtype": alias_dtype,
-    #                                 "description": f"Auto-alias from {name}",
-    #                                 "initial_value": None,
-    #                                 "readonly": False,
-    #                             }
-    #                             self.instantiate_wrappers([parsed_alias], replace=False)
 
-    #                         # 🔹 Push initial value to aliases immediately
-    #                         if init is not None:
-    #                             self._sync_mw_to_mb_mx(num)
-    #                 except Exception as e:
-    #                     logging.error(f"Failed to expand Word {name} -> {e}")
-                    
-    #             # without initial sync 
-    #             # elif dtype == "WORD":
-    #             #     obj = Word(name, address, desc)
-
-    #             #     # 🔹 Auto-expand Word into Byte + Bit aliases
-    #             #     try:
-    #             #         base, num, bit = parse_address(address)
-    #             #         if base == "MW":
-    #             #             # Each MW<n> corresponds to MB<2n> (low byte) and MB<2n+1> (high byte)
-    #             #             low_b = num * 2
-    #             #             high_b = low_b + 1
-                            
-    #             #             # Generate Byte wrappers
-    #             #             aliases = [
-    #             #                 (f"{name}_LowByte", f"%MB{low_b}", "BYTE"),
-    #             #                 (f"{name}_HighByte", f"%MB{high_b}", "BYTE"),
-    #             #             ]
-
-    #             #             # Generate Bit wrappers (0–7 each byte)
-    #             #             for b in range(8):
-    #             #                 aliases.append((f"{name}_LowBit{b}", f"%MX{low_b}.{b}", "BOOL"))
-    #             #                 aliases.append((f"{name}_HighBit{b}", f"%MX{high_b}.{b}", "BOOL"))
-
-    #             #             # Recursively instantiate these aliases as extra parsed vars
-    #             #             for alias_name, alias_addr, alias_dtype in aliases:
-    #             #                 parsed_alias = {
-    #             #                     "name": alias_name,
-    #             #                     "address": alias_addr,
-    #             #                     "dtype": alias_dtype,
-    #             #                     "description": f"Auto-alias from {name}",
-    #             #                     "initial_value": None,
-    #             #                     "readonly": False,
-    #             #                 }
-    #             #                 # Reuse same logic for adding
-    #             #                 self.instantiate_wrappers([parsed_alias], replace=False)
-                    
-    #                 # except Exception as e:
-    #                 #     logging.error(f"Failed to expand Word {name} -> {e}")
-                
-    #             else:
-    #                 logging.warning(f"Unsupported type {dtype} for {name}, defaulting to Word")
-    #                 obj = Word(name, address, desc)
-
-    #             # metadata
-    #             obj.initial_value = init
-    #             obj.readonly = readonly
-
-    #             # apply initial value if present (do not prevent future reads)
-    #             if init is not None:
-    #                 try:
-    #                     if hasattr(obj, "value"):
-    #                         obj.value = int(init)
-    #                     else:
-    #                         obj.value = init
-    #                 except Exception:
-    #                     obj.value = init
-
-    #             # store object in both variables (by name) and registry (by canonical address)
-    #             self.variables[name] = obj
-    #             self.registry[key] = obj
-    #             self.duplicates.setdefault(key, [name])
 
 
     # ---------------------------
@@ -723,6 +682,7 @@ class ModbusWrapper:
                         self.duplicates.setdefault(key, [name])
                 except Exception:
                     continue
+                
 
 
     # ---------------------------
